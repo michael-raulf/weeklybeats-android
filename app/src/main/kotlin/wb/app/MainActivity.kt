@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
@@ -26,15 +27,12 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
@@ -42,21 +40,13 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.fromHtml
-import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -67,7 +57,6 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private val Bg = Color(0xFF010103)
@@ -90,11 +79,14 @@ const val PAUSE = "❚❚"
 const val NEXT = "⏭︎"
 const val PREV = "⏮︎"
 
+private const val FOCUS_COMMENT = "document.querySelectorAll('.embed_video').forEach(function(e){e.remove()});" +
+    "var c=document.getElementById('comment')||document.getElementById('item_send_comment');" +
+    "if(c){c.scrollIntoView({block:'center'});c.focus()}"
+
 sealed interface Screen
-data object LoginScreen : Screen
 data object WeeksScreen : Screen
 data class WeekScreen(val n: Int) : Screen
-data class DetailScreen(val track: Track, val queue: List<Track>, val focus: Boolean) : Screen
+data class TrackScreen(val track: Track) : Screen
 
 fun Track.toItem(): MediaItem = MediaItem.Builder()
     .setMediaId(id)
@@ -124,7 +116,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge(SystemBarStyle.dark(android.graphics.Color.TRANSPARENT), SystemBarStyle.dark(android.graphics.Color.TRANSPARENT))
-        if (!Wb.loggedIn) stack += LoginScreen
         pendingComment = intent.getBooleanExtra("comment", false)
         future = MediaController.Builder(this, SessionToken(this, ComponentName(this, PlaybackService::class.java))).buildAsync()
         future.addListener({
@@ -138,7 +129,7 @@ class MainActivity : ComponentActivity() {
             current = c.currentMediaItem
             playing = c.isPlaying
             controller = c
-            if (pendingComment) openComment()
+            if (pendingComment) openCurrent()
         }, mainExecutor)
         setContent {
             MaterialTheme(Colors) {
@@ -151,7 +142,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        if (intent.getBooleanExtra("comment", false)) openComment()
+        if (intent.getBooleanExtra("comment", false)) openCurrent()
     }
 
     override fun onDestroy() {
@@ -163,16 +154,12 @@ class MainActivity : ComponentActivity() {
         stack.removeAt(stack.lastIndex)
     }
 
-    private fun openComment() {
+    private fun openCurrent() {
         pendingComment = false
-        val c = controller ?: return
-        val item = c.currentMediaItem ?: return
-        if (stack.last() == LoginScreen) return
-        if (stack.last() is DetailScreen) pop()
-        stack += DetailScreen(item.toTrack(), queue(c), true)
+        val item = controller?.currentMediaItem ?: return
+        if (stack.last() is TrackScreen) pop()
+        stack += TrackScreen(item.toTrack())
     }
-
-    private fun queue(c: Player) = List(c.mediaItemCount) { c.getMediaItemAt(it).toTrack() }
 
     private fun play(queue: List<Track>, track: Track) {
         val c = controller ?: return
@@ -188,46 +175,19 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun Root() {
         val top = stack.last()
-        BackHandler(stack.size > 1 && top != LoginScreen) { pop() }
+        BackHandler(stack.size > 1) { pop() }
         Column(Modifier.fillMaxSize().safeDrawingPadding()) {
             Box(Modifier.weight(1f)) {
                 key(top) {
                     when (top) {
-                        LoginScreen -> Login()
                         WeeksScreen -> Weeks()
                         is WeekScreen -> Week(top.n)
-                        is DetailScreen -> Detail(top)
+                        is TrackScreen -> TrackPage(top.track)
                     }
                 }
             }
-            if (top != LoginScreen) NowPlaying()
+            NowPlaying()
         }
-    }
-
-    @Composable
-    private fun Login() {
-        AndroidView(modifier = Modifier.fillMaxSize(), factory = { ctx ->
-            WebView(ctx).apply {
-                setBackgroundColor(Bg.toArgb())
-                settings.javaScriptEnabled = true
-                settings.domStorageEnabled = true
-                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView, url: String) {
-                        val js = "(function(){var r=document.getElementById('fld3');if(r)r.checked=true;" +
-                            "return document.getElementById('navforum')!=null&&document.getElementById('navlogin')==null})()"
-                        view.evaluateJavascript(js) {
-                            if (it == "true" && stack.last() == LoginScreen) {
-                                CookieManager.getInstance().flush()
-                                Wb.loggedIn = true
-                                pop()
-                            }
-                        }
-                    }
-                }
-                loadUrl("$BASE/forums/login/")
-            }
-        })
     }
 
     @Composable
@@ -283,7 +243,7 @@ class MainActivity : ComponentActivity() {
                         items(list, key = { it.id }) { track ->
                             Row(
                                 Modifier.fillMaxWidth()
-                                    .clickable { stack += DetailScreen(track, list, false) }
+                                    .clickable { stack += TrackScreen(track) }
                                     .alpha(if (track.id in played && current?.mediaId != track.id) 0.5f else 1f)
                                     .padding(horizontal = 4.dp, vertical = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically,
@@ -310,95 +270,35 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun Detail(screen: DetailScreen) {
-        val track = screen.track
-        var reload by remember { mutableIntStateOf(0) }
-        val page by produceState<Result<TrackPage>?>(null, reload) {
-            value = withContext(Dispatchers.IO) { runCatching { Wb.trackPage(track) } }
+    private fun TrackPage(track: Track) {
+        var web by remember { mutableStateOf<WebView?>(null) }
+        BackHandler {
+            val w = web
+            if (w != null && w.canGoBack()) w.goBack() else pop()
         }
-        var draft by remember { mutableStateOf(Wb.drafts[track.id].orEmpty()) }
-        var sending by remember { mutableStateOf(false) }
-        var error by remember { mutableStateOf<String?>(null) }
-        val scope = rememberCoroutineScope()
-        val focus = remember { FocusRequester() }
-        LaunchedEffect(Unit) { if (screen.focus) focus.requestFocus() }
-        val p = page
-        Column(Modifier.fillMaxSize()) {
-            LazyColumn(Modifier.weight(1f).padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                item {
-                    Row(Modifier.padding(top = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text(track.title, style = MaterialTheme.typography.titleLarge)
-                            Text(track.artist, style = MaterialTheme.typography.bodyMedium)
-                        }
-                        Button(onClick = { play(screen.queue, track) }) {
-                            Text(if (current?.mediaId == track.id && playing) PAUSE else PLAY)
-                        }
+        AndroidView(modifier = Modifier.fillMaxSize(), onRelease = { it.destroy() }, factory = { ctx ->
+            WebView(ctx).apply {
+                setBackgroundColor(Bg.toArgb())
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                        if (!request.isForMainFrame || request.url.host?.endsWith("weeklybeats.com") == true) return false
+                        startActivity(Intent(Intent.ACTION_VIEW, request.url))
+                        return true
                     }
-                }
-                when {
-                    p == null -> item { Text("Loading…") }
-                    p.isFailure -> item { Failed(p.exceptionOrNull()) { reload++ } }
-                    else -> {
-                        val data = p.getOrThrow()
-                        item { Html(data.description) }
-                        item { HorizontalDivider() }
-                        items(data.comments) {
-                            Column {
-                                Text("${it.author} · ${it.date}", style = MaterialTheme.typography.labelMedium)
-                                Html(it.html)
-                            }
-                        }
-                    }
-                }
-            }
-            error?.let { Text(it, Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.error) }
-            Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    draft,
-                    {
-                        draft = it
-                        Wb.drafts[track.id] = it
-                    },
-                    Modifier.weight(1f).focusRequester(focus),
-                    placeholder = { Text("Comment") },
-                )
-                TextButton(
-                    enabled = draft.isNotBlank() && !sending,
-                    onClick = {
-                        sending = true
-                        error = null
-                        scope.launch {
-                            try {
-                                withContext(Dispatchers.IO) { Wb.comment(track, draft.trim()) }
-                                draft = ""
-                                Wb.drafts.remove(track.id)
-                                reload++
-                            } catch (e: LoggedOut) {
-                                Wb.loggedIn = false
-                                stack += LoginScreen
-                            } catch (e: Exception) {
-                                error = e.message ?: "Comment failed"
-                            }
-                            sending = false
-                        }
-                    },
-                ) { Text(if (sending) "Sending" else "Send") }
-            }
-        }
-    }
 
-    @Composable
-    private fun Html(html: String) {
-        val color = MaterialTheme.colorScheme.primary
-        val text = remember(html, color) {
-            val s = AnnotatedString.fromHtml(
-                html,
-                TextLinkStyles(SpanStyle(color = color, textDecoration = TextDecoration.Underline)),
-            )
-            s.subSequence(0, s.text.trimEnd().length)
-        }
-        Text(text)
+                    override fun onPageFinished(view: WebView, url: String) {
+                        CookieManager.getInstance().flush()
+                        view.requestFocus()
+                        view.evaluateJavascript(FOCUS_COMMENT, null)
+                    }
+                }
+                loadUrl(track.link)
+                web = this
+            }
+        })
     }
 
     @Composable
@@ -416,7 +316,7 @@ class MainActivity : ComponentActivity() {
         Surface(color = Panel) {
             Row(
                 Modifier.fillMaxWidth()
-                    .clickable { stack += DetailScreen(item.toTrack(), queue(c), false) }
+                    .clickable { stack += TrackScreen(item.toTrack()) }
                     .padding(start = 16.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {

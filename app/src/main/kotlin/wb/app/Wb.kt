@@ -2,19 +2,15 @@ package wb.app
 
 import android.app.Application
 import android.content.Context
-import android.webkit.CookieManager
 import android.webkit.WebSettings
 import androidx.compose.runtime.mutableStateOf
-import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
-import org.jsoup.nodes.TextNode
 import java.io.File
 import java.io.IOException
-import java.net.URLEncoder
 import java.time.DayOfWeek
 import java.time.Duration
 import java.time.Instant
@@ -32,10 +28,6 @@ val YEAR = generateSequence(LocalDate.now(ZoneOffset.UTC).year + 1) { it - 1 }
     .first { it % 2 == 0 && start(it).plus(Duration.ofDays(7)) <= Instant.now() }
 
 data class Track(val id: String, val title: String, val artist: String, val link: String, val mp3: String)
-data class Comment(val author: String, val date: String, val html: String)
-data class TrackPage(val description: String, val comments: List<Comment>)
-
-class LoggedOut : Exception()
 
 class App : Application() {
     override fun onCreate() {
@@ -51,24 +43,14 @@ object Wb {
     private val ua by lazy { WebSettings.getDefaultUserAgent(app) }
 
     val played by lazy { mutableStateOf(prefs.getStringSet("played", emptySet())!!.toSet()) }
-    val drafts = mutableMapOf<String, String>()
-
-    var loggedIn: Boolean
-        get() = prefs.getBoolean("logged_in", false)
-        set(v) = prefs.edit().putBoolean("logged_in", v).apply()
 
     fun markPlayed(id: String) {
         played.value = played.value + id
         prefs.edit().putStringSet("played", played.value).apply()
     }
 
-    private fun Request.Builder.auth() = apply {
-        header("User-Agent", ua)
-        CookieManager.getInstance().getCookie(BASE)?.let { header("Cookie", it) }
-    }
-
     private fun get(url: String): String =
-        http.newCall(Request.Builder().url(url).auth().build()).execute().use {
+        http.newCall(Request.Builder().url(url).header("User-Agent", ua).build()).execute().use {
             if (!it.isSuccessful) throw IOException("HTTP ${it.code}")
             it.body!!.string()
         }
@@ -120,39 +102,5 @@ object Wb {
             val o = a.getJSONObject(it)
             Track(o.getString("id"), o.getString("title"), o.getString("artist"), o.getString("link"), o.getString("mp3"))
         }
-    }
-
-    fun trackPage(track: Track): TrackPage {
-        val html = get(track.link)
-        val description = html.substringAfter("<p id=\"item_description\">", "").substringBefore("<div id=\"item_license\">")
-        val comments = Jsoup.parse(html).select("#item_comments .post[id^=comment]").mapNotNull { e ->
-            val author = e.selectFirst(".username")?.text() ?: return@mapNotNull null
-            val body = e.selectFirst(".post-entry") ?: return@mapNotNull null
-            body.select(".q_comment").remove()
-            Comment(author, e.selectFirst(".post-link")?.text().orEmpty(), clean(body.html()))
-        }
-        return TrackPage(clean(description), comments)
-    }
-
-    private fun clean(html: String): String {
-        val body = Jsoup.parseBodyFragment(html).body()
-        body.select("iframe,embed,object,video,audio,script,style,.embed_video").remove()
-        body.select("img").forEach { img ->
-            if ("/smilies/" in img.attr("src")) img.replaceWith(TextNode(":${img.attr("alt")}:"))
-            else img.remove()
-        }
-        body.select("p").filter { !it.hasText() }.forEach { it.remove() }
-        return body.html()
-    }
-
-    fun comment(track: Track, text: String) {
-        val form = FormBody.Builder().add("comment", "comment=" + URLEncoder.encode(text, "UTF-8")).build()
-        val req = Request.Builder().url("$BASE/music/comment/add/${track.id}").post(form).auth()
-            .header("X-Requested-With", "XMLHttpRequest")
-            .header("Referer", track.link)
-        val response = http.newCall(req.build()).execute().use { it.body!!.string() }
-        if (response == "Comment Added.") return
-        if ("navlogin" in response || "logged in" in response.lowercase()) throw LoggedOut()
-        throw IOException(Jsoup.parse(response).text().take(200).ifBlank { "Comment failed" })
     }
 }
